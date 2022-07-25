@@ -1,209 +1,101 @@
+# tells WDL to use most recent version
 version development
 
-task GetScatter {
-
-    input {
-        File featureVariantFile
-        String outputName
-    }
-
-    command {
-        # bash environment
-        python get_scatter.py ${featureVariantFile} --outputName "${outputName}"
-    }
-
-    runtime {
-        memory: ""
-    }
-
-    output {
-        File thisIsMyOutputFile = "this is the output name.txt"
-    }
-}
-
-task RunInteraction {
-    input {
-        Int chrom
-        Float geneName
-        File sampleMappingFile
-        File genotypeFile
-        File phenotypeFile
-        File contextFile
-        File kinshipFile
-        File featureVariantFile
-        Int nContexts = 10
-    }
+import "tasks/CellRegMap.wdl" as C
+import "tasks/utils.wdl" as u
+import "tasks/post_processing.wdl" as pp
 
 
-    command {
-        conda activate my_conda_env
-        python run_interaction.py chrom geneName sampleMappingFile genotypeFile phenotypeFile contextFile kinshipFile featureVariantFile nContexts --outputFile ${geneName + ".tsv"}
-    }
-
-    output {
-        File geneOutput = geneName + ".tsv"
-    }
-
-    runtime {
-        # static
-        memory: "400Gb"
-        # # calculated
-        # memory: size(inputFile) + size(interval)
-        # # passed in
-        # memory: memory # from input
-    }
-}
-
-task AggregateInteractionResults {
-    input {
-        Array[File] listOfFiles
-        Float FDR_threshold
-    }
-
-    command {
-        python summarise.py --geneFiles {join(" ", listOfFiles)}
-    }
-
-    output {
-        File all_results
-        File significant_results_only
-    }
-}
-
-
-task EstimateBetas {
-    input {}
-
-    command {}
-
-    output {}
-
-    runtime {
-
-    }
-}
-
-task AggregateBetasResults {
-    input {
-        Array[File] listOfFiles
-    }
-
-    command {
-        python summarise_betas.py --geneFiles {join(" ", listOfFiles)}
-    }
-}
-
-task GetGeneChrPairs {
-    input {
-        File featureVariantsFile
-    }
-
-    command {
-        # does a thing
-        # write a TSV
-        echo 'chr1  BRCA1' > output.tsv
-    }
-
-    output {
-        Array[Array[String, String]] outputPairs = read_tsv("output.tsv")
-    }
-
-}
-
-
-# { WorkflowName.inputName: "value" }
-# { RunCellRegMap.contextFile: "" }
 workflow RunCellRegMap {
     input {
-        File [genotypeFile]
-        File [phenotypeFile]
+        Map[String, File] genotypeFiles # one file per chromosome
+        Map[String, File] genotypeFilesBims
+        Map[String, File] genotypeFilesFams
+        Map[String, File] phenotypeFiles
+        Map[String, File] mafFiles
         File contextFile
-        File covariateFile
         File kinshipFile
         File sampleMappingFile
         File featureVariantFile
-        Array[File] outputFiles
-
-
-        # how to determine which genes to run
-        Array[String] genes
-
-
-        Array[File] intervals
+        Int nContexts=10
+        Float FDR_threshold=1
+        # Array[File] outputFiles # what is this? do I need one for betas results too?
     }
 
-    if not is_defined(genes) {
-        call GetGeneList...
-    }
-
-    call UseGeneList {
-        geneList=select_first([genes, GetGeneList.genes])
-    }
-
-    call GetGeneChrPairs {
+    call u.GetGeneChrPairs as GetGeneChrPairs {
         input:
-            featureVariantFile=featureVariantFile
+            featureVariantFile=featureVariantFile,
+            columnsToSelect=["chrom", "gene"],
     }
 
-    call FeatureDoes {
-        input:
-            file=featureVariantFile
-    }
+    scatter (outputPair in GetGeneChrPairs.output_pairs) {
 
+        String RunInteractionChr = outputPair[0]
 
-    scatter ((chr, gene) in GetGeneChrPairs.outputPairs) {
-
-        call RunInteraction {
+        call C.RunInteraction as RunInteraction {
             input:
-                # smallFile is a couple of genes
-                inputFile=inputFile,
-                chr=chr,
-                gene=gene,
-                featureVariantFile
-
-        }
-        }
-
-    }
-
-    scatter (chrom_gene in ChromGenePairs) {
-        call RunInteraction {
-            input: 
-                Int chrom=GetScatter.out[0]
-                Int i=GetScatter.out[1]
-            conda activate my_conda_env
-            python run_interaction.py chrom i
+                # inputFile=inputFile, # what is this??
+                chrom=RunInteractionChr,
+                geneName=outputPair[1],
+                sampleMappingFile=sampleMappingFile,
+                genotypeFile=genotypeFiles[RunInteractionChr],
+                genotypeFilesBim=genotypeFilesBims[RunInteractionChr],
+                genotypeFilesFam=genotypeFilesFams[RunInteractionChr],
+                phenotypeFile=phenotypeFiles[RunInteractionChr],
+                contextFile=contextFile,
+                kinshipFile=kinshipFile,
+                featureVariantFile=featureVariantFile,
+                nContexts=nContexts,
         }
     }
 
-    call AggregateInteractionResults {
+    call pp.AggregateInteractionResults as AggregateInteractionResults{
         input:
-        # geneOutput is implicitly a Array[File]
-            listOfFiles=RunInteraction.geneOutput
+            # geneOutput is implicitly a Array[File]
+            listOfFiles=RunInteraction.geneOutput,
+            FDR_threshold=FDR_threshold,
 
     }
 
-    call CreateBetaFvf {
-        input 
-            File interaction_results.txt
-        ouput 
-            File beta_fvf
+    call u.GetGeneChrPairs as GetGeneChrPairsBetas {
+        input:
+            featureVariantFile=AggregateInteractionResults.significant_results,
+            columnsToSelect=["chrom", "gene"],
     }
-    call EstimateBetas {
-        input {
-            File beta_fvf
+
+    scatter (outputPair in GetGeneChrPairsBetas.output_pairs) { 
+
+        String EstimateBetaChr = outputPair[0]
+
+        call C.EstimateBetas as EstimateBetas {
+            input:
+                chrom=EstimateBetaChr,
+                geneName=outputPair[1],
+                sampleMappingFile=sampleMappingFile,
+                genotypeFile=genotypeFiles[EstimateBetaChr],
+                genotypeFilesBim=genotypeFilesBims[EstimateBetaChr],
+                genotypeFilesFam=genotypeFilesFams[EstimateBetaChr],
+                phenotypeFile=phenotypeFiles[EstimateBetaChr],
+                contextFile=contextFile,
+                kinshipFile=kinshipFile,
+                betaFeatureVariantFile=AggregateInteractionResults.significant_results,
+                nContexts=nContexts,
+                mafFile=mafFiles[EstimateBetaChr],
         }
     }
 
-    runtime {
-        memory: memory_requirements
-        cpus: 4
-        container: "limix/cellregmap:v1.0.0"
+    call pp.AggregateBetaResults as AggregateBetaResults{
+        input:
+            listOfFiles1=EstimateBetas.geneOutput1,
+            listOfFiles2=EstimateBetas.geneOutput2
+
     }
 
     output {
-        File out_interaction = AggregateIntegrationResults.out
-        File out_betas = AggregateBetaResults.out
+        File out_interaction_all_results = AggregateInteractionResults.all_results
+        File out_interaction_significant_results = AggregateInteractionResults.significant_results
+        File out_betaG = AggregateBetaResults.all_betaG
+        File out_betaGxC = AggregateBetaResults.all_betaGxC
     }
 
 }
